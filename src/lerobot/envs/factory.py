@@ -101,11 +101,12 @@ def make_env(
                 f"Environment '{cfg.gym_id}' not registered even after importing '{cfg.package_name}'."
             )
 
+    cfg.gym_kwargs['shape'] = 224
     def _make_one():
         return gym.make(cfg.gym_id, disable_env_checker=cfg.disable_env_checker, **(cfg.gym_kwargs or {}))
+    
 
     vec = env_cls([_make_one for _ in range(n_envs)], autoreset_mode=gym.vector.AutoresetMode.SAME_STEP)
-
     # normalize to {suite: {task_id: vec_env}} for consistency
     suite_name = cfg.type  # e.g., "pusht", "aloha"
     return {suite_name: {0: vec}}

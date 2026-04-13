@@ -168,6 +168,7 @@ def rollout(
         observation = preprocessor(observation)
         with torch.inference_mode():
             action = policy.select_action(observation)
+        
         action = postprocessor(action)
 
         # Convert to CPU / numpy.

@@ -231,6 +231,7 @@ def wrap(config_path: Path | None = None) -> Callable[[F], F]:
                 else:
                     cfg = draccus.parse(config_class=argtype, config_path=config_path, args=cli_args)
             response = fn(cfg, *args, **kwargs)
+            
             return response
 
         return cast(F, wrapper_inner)
