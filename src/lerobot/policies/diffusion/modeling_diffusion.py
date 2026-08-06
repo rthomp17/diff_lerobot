@@ -48,7 +48,7 @@ from lerobot.policies.utils import (
 )
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
-from difftree.pusht.pusht_env_utils import pusht_diffusion_gradient_fig
+# from difftree.pusht.pusht_env_utils import pusht_diffusion_gradient_fig
 
 
 def _ddpm_scheduler_remove_noise(
@@ -255,8 +255,10 @@ class DiffusionModel(nn.Module):
 
         self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
 
-        self.noise_scheduler = _make_noise_scheduler(
-            config.noise_scheduler_type,
+        # Keep the scheduler kwargs so alternate scheduler types (DDPM/DDIM) can be built on demand
+        # for objective-cost computation. Both types share the same betas/timesteps, so they can be
+        # swapped freely; see `_get_scheduler`.
+        self._noise_scheduler_kwargs = dict(
             num_train_timesteps=config.num_train_timesteps,
             beta_start=config.beta_start,
             beta_end=config.beta_end,
@@ -265,6 +267,8 @@ class DiffusionModel(nn.Module):
             clip_sample_range=config.clip_sample_range,
             prediction_type=config.prediction_type,
         )
+        self._schedulers: dict[str, DDPMScheduler | DDIMScheduler] = {}
+        self.noise_scheduler = self._get_scheduler(config.noise_scheduler_type)
 
         if config.num_inference_steps is None:
             self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
@@ -276,6 +280,22 @@ class DiffusionModel(nn.Module):
         self.save_denoising_data = False
         self.save_denoising_data_location = None
         self.n_stochastic_sampling_steps = 1
+
+    def _get_scheduler(self, scheduler_type: str | None = None) -> DDPMScheduler | DDIMScheduler:
+        """Return a (cached) noise scheduler of the requested type ("DDPM" or "DDIM").
+
+        ``None`` returns the policy's default scheduler (``config.noise_scheduler_type``). The two
+        types share the same betas/timesteps, so either can be used to compute objective costs; the
+        difference shows up in the reverse ``step`` (DDPM is stochastic, DDIM deterministic), which
+        matters for ``compute_partial_restoration_gap``.
+        """
+        if scheduler_type is None:
+            scheduler_type = self.config.noise_scheduler_type
+        if scheduler_type not in self._schedulers:
+            self._schedulers[scheduler_type] = _make_noise_scheduler(
+                scheduler_type, **self._noise_scheduler_kwargs
+            )
+        return self._schedulers[scheduler_type]
 
     #Hacky solution to avoid having to propogate guidance info through like six functions
     def setup_guidance_functions(self, visualize,  guidance, obs, env=None, action_postprocessor=None, save_denoising_data=False, save_denoising_data_location=None):
@@ -331,8 +351,8 @@ class DiffusionModel(nn.Module):
                     torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
                     global_cond=global_cond,
                 )
+                
                 if self.guidance_functions is not None:
-                    
                     grad = self.guidance_functions.get_gradient(sample, self.current_obs)
                     model_output = model_output + grad
                     
@@ -361,10 +381,10 @@ class DiffusionModel(nn.Module):
                     denormalize(t)
                     for t in trajectory
                 ]
-                denoising_figure = pusht_diffusion_gradient_fig(trajectory, gradients, self.env)
+                # denoising_figure = pusht_diffusion_gradient_fig(trajectory, gradients, self.env)
 
-                denoising_figure.show()
-                input("Press enter to continue...")
+                # denoising_figure.show()
+                # input("Press enter to continue...")
 
         if False:
                 timestr = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -440,7 +460,22 @@ class DiffusionModel(nn.Module):
 
         return actions
 
-    def compute_loss(self, batch: dict[str, Tensor], timesteps: Tensor | int = None, return_prediction: bool = False, over_batch=False) -> Tensor:
+    def generate_full_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+        """Sample a full-horizon action trajectory ``(B, horizon, action_dim)``.
+
+        Same as ``generate_actions`` but WITHOUT the ``[:, start:end]`` truncation to
+        ``n_action_steps``: the returned trajectory has the full diffusion ``horizon`` length (the
+        same length as the sampling noise vector). This is what callers that need whole diffusion
+        trajectories (e.g. seeding a planner whose objective re-noises the trajectory) should use, so
+        the trajectory length matches what the U-Net was trained on.
+        """
+        batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
+        assert n_obs_steps == self.config.n_obs_steps
+
+        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+        return self.conditional_sample(batch_size, global_cond=global_cond, noise=noise)
+
+    def compute_loss(self, batch: dict[str, Tensor], timesteps: Tensor | int = None, return_prediction: bool = False, over_batch=False, scheduler_type: str | None = None) -> Tensor:
         """
         This function expects `batch` to have (at least):
         {
@@ -453,6 +488,9 @@ class DiffusionModel(nn.Module):
             "action": (B, horizon, action_dim)
             "action_is_pad": (B, horizon)
         }
+
+        ``scheduler_type`` selects the noise scheduler ("DDPM" or "DDIM") used to compute the cost;
+        ``None`` uses the policy's default (``config.noise_scheduler_type``).
         """
         # Input validation.
         assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
@@ -461,6 +499,8 @@ class DiffusionModel(nn.Module):
         horizon = batch[ACTION].shape[1]
         #assert horizon == self.config.horizon
         assert n_obs_steps == self.config.n_obs_steps
+
+        scheduler = self._get_scheduler(scheduler_type)
 
         # Encode image features and concatenate them all together along with the state vector.
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
@@ -473,12 +513,12 @@ class DiffusionModel(nn.Module):
         if timesteps is None:
             timesteps = torch.randint(
                 low=0,
-                high=self.noise_scheduler.config.num_train_timesteps,
+                high=scheduler.config.num_train_timesteps,
                 size=(trajectory.shape[0],),
                 device=trajectory.device,
             ).long()
         # Add noise to the clean trajectories according to the noise magnitude at each timestep.
-        noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
+        noisy_trajectory = scheduler.add_noise(trajectory, eps, timesteps)
 
         # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
         pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
@@ -507,14 +547,87 @@ class DiffusionModel(nn.Module):
             loss = loss * in_episode_bound.unsqueeze(-1)
 
         if return_prediction:
-            pred_target = _ddpm_scheduler_remove_noise(self.noise_scheduler, noisy_trajectory, pred, timesteps)
-            
+            pred_target = _ddpm_scheduler_remove_noise(scheduler, noisy_trajectory, pred, timesteps)
+
             if over_batch:
                 return loss.mean(dim=(2)), pred_target
             return loss.mean(), pred_target
         if over_batch:
             return loss.mean(dim=(2))
         return loss.mean()
+
+    def compute_partial_restoration_gap(
+        self,
+        batch: dict[str, Tensor],
+        timesteps: Tensor | int = None,
+        return_prediction: bool = False,
+        over_batch: bool = False,
+        scheduler_type: str | None = None,
+    ) -> Tensor:
+        """Score a trajectory by the gap left after a full reverse restoration from `timesteps`.
+
+        Unlike `compute_loss`, which takes a single denoising step, this noises the actions to the
+        given start timestep and then walks the reverse diffusion chain all the way down to t=0 (the
+        same scheduler loop as `conditional_sample`, without guidance or stochastic resampling),
+        measuring how far the restored trajectory lands from the original actions. Signature and
+        return contract mirror `compute_loss` so it is a drop-in.
+
+        ``scheduler_type`` selects the noise scheduler ("DDPM" or "DDIM") used for the reverse chain;
+        ``None`` uses the policy's default (``config.noise_scheduler_type``). DDPM steps are
+        stochastic while DDIM steps are deterministic, so this changes the restored trajectory.
+        """
+        assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
+        assert OBS_IMAGES in batch or OBS_ENV_STATE in batch
+        assert batch[OBS_STATE].shape[1] == self.config.n_obs_steps
+
+        scheduler = self._get_scheduler(scheduler_type)
+
+        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+        trajectory = batch[ACTION]
+        batch_size = trajectory.shape[0]
+        device = trajectory.device
+
+        # Resolve the start timestep to a per-batch (B,) long tensor.
+        if timesteps is None:
+            timesteps = torch.randint(
+                low=0,
+                high=scheduler.config.num_train_timesteps,
+                size=(batch_size,),
+                device=device,
+            ).long()
+        elif not torch.is_tensor(timesteps):
+            timesteps = torch.full((batch_size,), int(timesteps), device=device, dtype=torch.long)
+
+        # Noise the real trajectory up to the start timestep, then denoise back down to t=0.
+        eps = torch.randn(trajectory.shape, device=device)
+        sample = scheduler.add_noise(trajectory, eps, timesteps)
+
+        start_t = int(timesteps.max().item())
+        scheduler.set_timesteps(scheduler.config.num_train_timesteps)
+        for t in scheduler.timesteps:  # descending: num_train_timesteps-1 .. 0
+            if t > start_t:
+                continue  # begin the reverse chain at the requested start timestep
+            model_output = self.unet(
+                sample,
+                torch.full(sample.shape[:1], t, dtype=torch.long, device=device),
+                global_cond=global_cond,
+            )
+            sample = scheduler.step(model_output, t, sample).prev_sample
+
+        restored = sample  # fully denoised trajectory (t == 0)
+
+        loss = F.mse_loss(restored, trajectory, reduction="none")
+        if self.config.do_mask_loss_for_padding and "action_is_pad" in batch:
+            loss = loss * (~batch["action_is_pad"]).unsqueeze(-1)
+
+        if return_prediction:
+            if over_batch:
+                return loss.mean(dim=(2)), restored
+            return loss.mean(), restored
+        if over_batch:
+            return loss.mean(dim=(2))
+        return loss.mean()
+
 
 class SpatialSoftmax(nn.Module):
     """
