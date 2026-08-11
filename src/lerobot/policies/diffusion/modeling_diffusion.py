@@ -22,77 +22,76 @@ TODO(alexander-soare):
 
 import math
 from collections import deque
-from collections.abc import Callable
+from typing import Callable
 
 import einops
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 import torchvision
-import copy as cp
-from datetime import datetime
-from pathlib import Path
-import pickle
-
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from huggingface_hub import PyTorchModelHubMixin
 from torch import Tensor, nn
 
-from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
-from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.utils import (
+from lerobot.common.policies.diffusion.configuration_diffusion import DiffusionConfig
+from lerobot.common.policies.normalize import Normalize, Unnormalize
+from lerobot.common.policies.utils import (
     get_device_from_parameters,
     get_dtype_from_parameters,
-    get_output_shape,
     populate_queues,
 )
-from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
-
-# from difftree.pusht.pusht_env_utils import pusht_diffusion_gradient_fig
 
 
 def _ddpm_scheduler_remove_noise(
-        scheduler,
-        noisy_sample: torch.Tensor,
-        noise: torch.Tensor,
-        timesteps: torch.IntTensor,
-    ) -> torch.Tensor:
-        
-        # Make sure alphas_cumprod and timestep have same device and dtype as original_samples
-        # Move the self.alphas_cumprod to device to avoid redundant CPU to GPU data movement
-        # for the subsequent add_noise calls
-        alphas_cumprod = scheduler.alphas_cumprod.to(device=noisy_sample.device)
+    scheduler,
+    noisy_sample: torch.Tensor,
+    noise: torch.Tensor,
+    timesteps: torch.IntTensor,
+) -> torch.Tensor:
+    """Invert ``scheduler.add_noise``: recover the clean sample from a noisy sample and its noise.
 
-        alphas_cumprod = scheduler.alphas_cumprod.to(dtype=noisy_sample.dtype)
+    Given ``noisy_sample = sqrt(alpha_prod) * original + sqrt(1 - alpha_prod) * noise`` this solves
+    for ``original``. Used to turn a predicted noise (``epsilon``) into a predicted clean trajectory.
+    """
+    # Make sure alphas_cumprod and timestep have same device and dtype as original_samples.
+    alphas_cumprod = scheduler.alphas_cumprod.to(device=noisy_sample.device)
+    alphas_cumprod = scheduler.alphas_cumprod.to(dtype=noisy_sample.dtype)
 
-        timesteps = timesteps.to(noisy_sample.device)
+    timesteps = timesteps.to(noisy_sample.device)
 
-        sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
-        sqrt_alpha_prod = sqrt_alpha_prod.flatten()
-        while len(sqrt_alpha_prod.shape) < len(noisy_sample.shape):
-            sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+    sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
+    sqrt_alpha_prod = sqrt_alpha_prod.flatten()
+    while len(sqrt_alpha_prod.shape) < len(noisy_sample.shape):
+        sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
 
-        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
-        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
-        while len(sqrt_one_minus_alpha_prod.shape) < len(noisy_sample.shape):
-            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+    sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
+    sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
+    while len(sqrt_one_minus_alpha_prod.shape) < len(noisy_sample.shape):
+        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+
+    original_sample = (noisy_sample - sqrt_one_minus_alpha_prod * noise) / sqrt_alpha_prod
+    return original_sample
 
 
-        original_sample = (noisy_sample - sqrt_one_minus_alpha_prod * noise)/sqrt_alpha_prod
-        return original_sample
-
-class DiffusionPolicy(PreTrainedPolicy):
+class DiffusionPolicy(
+    nn.Module,
+    PyTorchModelHubMixin,
+    library_name="lerobot",
+    repo_url="https://github.com/huggingface/lerobot",
+    tags=["robotics", "diffusion-policy"],
+):
     """
     Diffusion Policy as per "Diffusion Policy: Visuomotor Policy Learning via Action Diffusion"
-    (paper: https://huggingface.co/papers/2303.04137, code: https://github.com/real-stanford/diffusion_policy).
+    (paper: https://arxiv.org/abs/2303.04137, code: https://github.com/real-stanford/diffusion_policy).
     """
 
-    config_class = DiffusionConfig
     name = "diffusion"
 
     def __init__(
         self,
-        config: DiffusionConfig,
+        config: DiffusionConfig | None = None,
+        dataset_stats: dict[str, dict[str, Tensor]] | None = None,
     ):
         """
         Args:
@@ -101,42 +100,43 @@ class DiffusionPolicy(PreTrainedPolicy):
             dataset_stats: Dataset statistics to be used for normalization. If not passed here, it is expected
                 that they will be passed with a call to `load_state_dict` before the policy is used.
         """
-        super().__init__(config)
-        config.validate_features()
+        super().__init__()
+        if config is None:
+            config = DiffusionConfig()
         self.config = config
+        self.normalize_inputs = Normalize(
+            config.input_shapes, config.input_normalization_modes, dataset_stats
+        )
+        self.normalize_targets = Normalize(
+            config.output_shapes, config.output_normalization_modes, dataset_stats
+        )
+        self.unnormalize_outputs = Unnormalize(
+            config.output_shapes, config.output_normalization_modes, dataset_stats
+        )
 
         # queues are populated during rollout of the policy, they contain the n latest observations and actions
         self._queues = None
 
         self.diffusion = DiffusionModel(config)
 
-        self.reset()
+        self.expected_image_keys = [k for k in config.input_shapes if k.startswith("observation.image")]
+        self.use_env_state = "observation.environment_state" in config.input_shapes
 
-    def get_optim_params(self) -> dict:
-        return self.diffusion.parameters()
+        self.reset()
 
     def reset(self):
         """Clear observation and action queues. Should be called on `env.reset()`"""
         self._queues = {
-            OBS_STATE: deque(maxlen=self.config.n_obs_steps),
-            ACTION: deque(maxlen=self.config.n_action_steps),
+            "observation.state": deque(maxlen=self.config.n_obs_steps),
+            "action": deque(maxlen=self.config.n_action_steps),
         }
-        if self.config.image_features:
-            self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
-        if self.config.env_state_feature:
-            self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
+        if len(self.expected_image_keys) > 0:
+            self._queues["observation.images"] = deque(maxlen=self.config.n_obs_steps)
+        if self.use_env_state:
+            self._queues["observation.environment_state"] = deque(maxlen=self.config.n_obs_steps)
 
-    @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
-        """Predict a chunk of actions given environment observations."""
-        # stack n latest observations from the queue
-        batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
-        actions = self.diffusion.generate_actions(batch, noise=noise)
-
-        return actions
-
-    @torch.no_grad()
-    def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+    @torch.no_grad
+    def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations.
 
         This method handles caching a history of observations and an action trajectory generated by the
@@ -157,68 +157,35 @@ class DiffusionPolicy(PreTrainedPolicy):
         "horizon" may not the best name to describe what the variable actually means, because this period is
         actually measured from the first observation which (if `n_obs_steps` > 1) happened in the past.
         """
-        # NOTE: for offline evaluation, we have action in the batch, so we need to pop it out
-        if ACTION in batch:
-            batch.pop(ACTION)
-
-        if self.config.image_features:
+        batch = self.normalize_inputs(batch)
+        if len(self.expected_image_keys) > 0:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
-        # NOTE: It's important that this happens after stacking the images into a single key.
+            batch["observation.images"] = torch.stack([batch[k] for k in self.expected_image_keys], dim=-4)
+        # Note: It's important that this happens after stacking the images into a single key.
         self._queues = populate_queues(self._queues, batch)
 
-        if len(self._queues[ACTION]) == 0:
-            actions = self.predict_action_chunk(batch, noise=noise)
-            self._queues[ACTION].extend(actions.transpose(0, 1))
+        if len(self._queues["action"]) == 0:
+            # stack n latest observations from the queue
+            batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+            actions = self.diffusion.generate_actions(batch)
 
-        action = self._queues[ACTION].popleft()
+            # TODO(rcadene): make above methods return output dictionary?
+            actions = self.unnormalize_outputs({"action": actions})["action"]
+
+            self._queues["action"].extend(actions.transpose(0, 1))
+
+        action = self._queues["action"].popleft()
         return action
-    
-    @torch.no_grad()
-    def predict_action_sequence(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
-        """Select a single action given environment observations.
 
-        This method handles caching a history of observations and an action trajectory generated by the
-        underlying diffusion model. Here's how it works:
-          - `n_obs_steps` steps worth of observations are cached (for the first steps, the observation is
-            copied `n_obs_steps` times to fill the cache).
-          - The diffusion model generates `horizon` steps worth of actions.
-          - `n_action_steps` worth of actions are actually kept for execution, starting from the current step.
-        Schematically this looks like:
-            ----------------------------------------------------------------------------------------------
-            (legend: o = n_obs_steps, h = horizon, a = n_action_steps)
-            |timestep            | n-o+1 | n-o+2 | ..... | n     | ..... | n+a-1 | n+a   | ..... | n-o+h |
-            |observation is used | YES   | YES   | YES   | YES   | NO    | NO    | NO    | NO    | NO    |
-            |action is generated | YES   | YES   | YES   | YES   | YES   | YES   | YES   | YES   | YES   |
-            |action is used      | NO    | NO    | NO    | YES   | YES   | YES   | NO    | NO    | NO    |
-            ----------------------------------------------------------------------------------------------
-        Note that this means we require: `n_action_steps <= horizon - n_obs_steps + 1`. Also, note that
-        "horizon" may not the best name to describe what the variable actually means, because this period is
-        actually measured from the first observation which (if `n_obs_steps` > 1) happened in the past.
-        """
-        # NOTE: for offline evaluation, we have action in the batch, so we need to pop it out
-        if ACTION in batch:
-            batch.pop(ACTION)
-
-        if self.config.image_features:
-            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
-        # NOTE: It's important that this happens after stacking the images into a single key.
-        self._queues = populate_queues(self._queues, batch)
-
-        if len(self._queues[ACTION]) == 0:
-            actions = self.predict_action_chunk(batch, noise=noise)
-
-        return actions.transpose(0, 1)
-    
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
+    def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Run the batch through the model and compute the loss for training or validation."""
-        if self.config.image_features:
+        batch = self.normalize_inputs(batch)
+        if len(self.expected_image_keys) > 0:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+            batch["observation.images"] = torch.stack([batch[k] for k in self.expected_image_keys], dim=-4)
+        batch = self.normalize_targets(batch)
         loss = self.diffusion.compute_loss(batch)
-        # no output_dict so returning None
-        return loss, None
+        return {"loss": loss}
 
 
 def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
@@ -240,18 +207,17 @@ class DiffusionModel(nn.Module):
         self.config = config
 
         # Build observation encoders (depending on which observations are provided).
-        global_cond_dim = self.config.robot_state_feature.shape[0]
-        if self.config.image_features:
-            num_images = len(self.config.image_features)
-            if self.config.use_separate_rgb_encoder_per_camera:
-                encoders = [DiffusionRgbEncoder(config) for _ in range(num_images)]
-                self.rgb_encoder = nn.ModuleList(encoders)
-                global_cond_dim += encoders[0].feature_dim * num_images
-            else:
-                self.rgb_encoder = DiffusionRgbEncoder(config)
-                global_cond_dim += self.rgb_encoder.feature_dim * num_images
-        if self.config.env_state_feature:
-            global_cond_dim += self.config.env_state_feature.shape[0]
+        global_cond_dim = config.input_shapes["observation.state"][0]
+        num_images = len([k for k in config.input_shapes if k.startswith("observation.image")])
+        self._use_images = False
+        self._use_env_state = False
+        if num_images > 0:
+            self._use_images = True
+            self.rgb_encoder = DiffusionRgbEncoder(config)
+            global_cond_dim += self.rgb_encoder.feature_dim * num_images
+        if "observation.environment_state" in config.input_shapes:
+            self._use_env_state = True
+            global_cond_dim += config.input_shapes["observation.environment_state"][0]
 
         self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
 
@@ -275,10 +241,10 @@ class DiffusionModel(nn.Module):
         else:
             self.num_inference_steps = config.num_inference_steps
 
+        # Classifier(-free) guidance state, populated by `setup_guidance_functions`. When
+        # `guidance_functions` is None the sampler behaves exactly as vanilla diffusion policy.
         self.guidance_functions = None
-        self.visualize_denoising_process = False
-        self.save_denoising_data = False
-        self.save_denoising_data_location = None
+        self.current_obs = None
         self.n_stochastic_sampling_steps = 1
 
     def _get_scheduler(self, scheduler_type: str | None = None) -> DDPMScheduler | DDIMScheduler:
@@ -297,16 +263,20 @@ class DiffusionModel(nn.Module):
             )
         return self._schedulers[scheduler_type]
 
-    #Hacky solution to avoid having to propogate guidance info through like six functions
-    def setup_guidance_functions(self, visualize,  guidance, obs, env=None, action_postprocessor=None, save_denoising_data=False, save_denoising_data_location=None):
-        self.env = env
-        self.visualize_denoising_process = visualize
-        self.action_postprocessor = action_postprocessor
-        self.n_stochastic_sampling_steps = 4
-        self.current_obs = obs
+    def setup_guidance_functions(self, guidance, obs, n_stochastic_sampling_steps: int = 4):
+        """Enable classifier guidance during sampling.
+
+        Args:
+            guidance: object exposing ``get_gradient(sample, obs)`` returning a gradient with the same
+                shape as the diffusion sample; it is added to the U-Net output at each denoising step.
+            obs: the observation passed through to ``guidance.get_gradient`` (kept as ``current_obs``).
+            n_stochastic_sampling_steps: number of stochastic resampling iterations per timestep. With
+                guidance, resampling the clean estimate and re-noising helps the guided sample stay on
+                the data manifold. Set to 1 to disable resampling.
+        """
         self.guidance_functions = guidance
-        self.save_denoising_data = save_denoising_data
-        self.save_denoising_data_location = save_denoising_data_location
+        self.current_obs = obs
+        self.n_stochastic_sampling_steps = n_stochastic_sampling_steps
 
     # ========= inference  ============
     def conditional_sample(
@@ -319,12 +289,12 @@ class DiffusionModel(nn.Module):
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
 
-        # Sample prior.
+        # Sample prior (or use the provided noise, e.g. to reproduce a trajectory).
         sample = (
             noise
             if noise is not None
             else torch.randn(
-                size=(batch_size, self.config.horizon, self.config.action_feature.shape[0]),
+                size=(batch_size, self.config.horizon, self.config.output_shapes["action"][0]),
                 dtype=dtype,
                 device=device,
                 generator=generator,
@@ -332,108 +302,60 @@ class DiffusionModel(nn.Module):
         )
 
         self.noise_scheduler.set_timesteps(self.num_inference_steps)
-        trajectory = []
-        gradients = []
 
-        # For interactive visualization
-        denoising_data = {}
-
-        # Utility function to denormalize poses for visualization
-        denormalize = lambda x: self.action_postprocessor(x
-        )
-        
         for t in self.noise_scheduler.timesteps:
+            # `n_stochastic_sampling_steps` is 1 without guidance, so this inner loop is a no-op then
+            # and the sampler matches vanilla diffusion policy exactly.
             for i in range(self.n_stochastic_sampling_steps):
-                
                 # Predict model output.
                 model_output = self.unet(
                     sample,
                     torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
                     global_cond=global_cond,
                 )
-                
+
+                # Classifier guidance: nudge the prediction with the guidance gradient.
                 if self.guidance_functions is not None:
                     grad = self.guidance_functions.get_gradient(sample, self.current_obs)
                     model_output = model_output + grad
-                    
+
                 scheduler_output = self.noise_scheduler.step(model_output, t, sample, generator=generator)
 
                 if self.guidance_functions is not None and i < self.n_stochastic_sampling_steps - 1:
-                    std = 1
+                    # Stochastic resampling: re-noise the predicted clean sample to the current
+                    # timestep and take another guided step, keeping the sample near the data manifold.
                     clean_sample = scheduler_output.pred_original_sample
-                    ss_noise = std * torch.randn(clean_sample.shape, device=clean_sample.device)
+                    ss_noise = torch.randn(clean_sample.shape, device=clean_sample.device)
                     sample = self.noise_scheduler.add_noise(clean_sample, ss_noise, t)
-                    if self.save_denoising_data:
-                            denoising_data[t][i]["ss_noise"] = denormalize(ss_noise)
-                            denoising_data[t][i]["pre_ss_poses"] = denormalize(scheduler_output.prev_sample)
-                            denoising_data[t][i]["poses"] = denormalize(sample)
-                            denoising_data[t][i]["pred_original"] = denormalize(clean_sample)
-                            denoising_data[t][i]["grad"] = grad.reshape(batch_size, -1, 2)
-                    
                 else:
+                    # Compute previous image: x_t -> x_t-1
                     sample = scheduler_output.prev_sample
-                    if self.visualize_denoising_process:
-                        trajectory.append(sample.clone())
-                        gradients.append(cp.deepcopy(grad))
-        
-        if self.visualize_denoising_process:
-                trajectory = [
-                    denormalize(t)
-                    for t in trajectory
-                ]
-                # denoising_figure = pusht_diffusion_gradient_fig(trajectory, gradients, self.env)
-
-                # denoising_figure.show()
-                # input("Press enter to continue...")
-
-        if False:
-                timestr = datetime.now().strftime("%Y%m%d_%H%M%S")
-                with open(Path(self.save_denoising_data_location) / f"{timestr}_denoising_data.pkl", "wb") as f:
-                    pickle.dump(denoising_data, f)
-
-            # Compute previous image: x_t -> x_t-1
 
         return sample
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         """Encode image features and concatenate them all together along with the state vector."""
-        batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
-        global_cond_feats = [batch[OBS_STATE]]
-        # Extract image features.
-        if self.config.image_features:
-            if self.config.use_separate_rgb_encoder_per_camera:
-                # Combine batch and sequence dims while rearranging to make the camera index dimension first.
-                images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
-                img_features_list = torch.cat(
-                    [
-                        encoder(images)
-                        for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
-                    ]
-                )
-                # Separate batch and sequence dims back out. The camera index dim gets absorbed into the
-                # feature dim (effectively concatenating the camera features).
-                img_features = einops.rearrange(
-                    img_features_list, "(n b s) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
-                )
-            else:
-                # Combine batch, sequence, and "which camera" dims before passing to shared encoder.
-                img_features = self.rgb_encoder(
-                    einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
-                )
-                # Separate batch dim and sequence dim back out. The camera index dim gets absorbed into the
-                # feature dim (effectively concatenating the camera features).
-                img_features = einops.rearrange(
-                    img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
-                )
+        batch_size, n_obs_steps = batch["observation.state"].shape[:2]
+        global_cond_feats = [batch["observation.state"]]
+        # Extract image feature (first combine batch, sequence, and camera index dims).
+        if self._use_images:
+            img_features = self.rgb_encoder(
+                einops.rearrange(batch["observation.images"], "b s n ... -> (b s n) ...")
+            )
+            # Separate batch dim and sequence dim back out. The camera index dim gets absorbed into the
+            # feature dim (effectively concatenating the camera features).
+            img_features = einops.rearrange(
+                img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+            )
             global_cond_feats.append(img_features)
 
-        if self.config.env_state_feature:
-            global_cond_feats.append(batch[OBS_ENV_STATE])
+        if self._use_env_state:
+            global_cond_feats.append(batch["observation.environment_state"])
 
         # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
 
-    def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+    def generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
         """
         This function expects `batch` to have:
         {
@@ -441,17 +363,17 @@ class DiffusionModel(nn.Module):
 
             "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
                 AND/OR
-            "observation.environment_state": (B, n_obs_steps, environment_dim)
+            "observation.environment_state": (B, environment_dim)
         }
         """
-        batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
+        batch_size, n_obs_steps = batch["observation.state"].shape[:2]
         assert n_obs_steps == self.config.n_obs_steps
 
         # Encode image features and concatenate them all together along with the state vector.
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
         # run sampling
-        actions = self.conditional_sample(batch_size, global_cond=global_cond, noise=noise)
+        actions = self.conditional_sample(batch_size, global_cond=global_cond)
 
         # Extract `n_action_steps` steps worth of actions (from the current observation).
         start = n_obs_steps - 1
@@ -469,13 +391,20 @@ class DiffusionModel(nn.Module):
         trajectories (e.g. seeding a planner whose objective re-noises the trajectory) should use, so
         the trajectory length matches what the U-Net was trained on.
         """
-        batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
+        batch_size, n_obs_steps = batch["observation.state"].shape[:2]
         assert n_obs_steps == self.config.n_obs_steps
 
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
         return self.conditional_sample(batch_size, global_cond=global_cond, noise=noise)
 
-    def compute_loss(self, batch: dict[str, Tensor], timesteps: Tensor | int = None, return_prediction: bool = False, over_batch=False, scheduler_type: str | None = None) -> Tensor:
+    def compute_loss(
+        self,
+        batch: dict[str, Tensor],
+        timesteps: Tensor | int | None = None,
+        return_prediction: bool = False,
+        over_batch: bool = False,
+        scheduler_type: str | None = None,
+    ) -> Tensor:
         """
         This function expects `batch` to have (at least):
         {
@@ -483,21 +412,27 @@ class DiffusionModel(nn.Module):
 
             "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
                 AND/OR
-            "observation.environment_state": (B, n_obs_steps, environment_dim)
+            "observation.environment_state": (B, environment_dim)
 
             "action": (B, horizon, action_dim)
             "action_is_pad": (B, horizon)
         }
 
-        ``scheduler_type`` selects the noise scheduler ("DDPM" or "DDIM") used to compute the cost;
-        ``None`` uses the policy's default (``config.noise_scheduler_type``).
+        Args:
+            timesteps: noising timestep(s). ``None`` samples a random timestep per batch item (the
+                default training behaviour); pass a tensor/int to fix it (e.g. for objective costs).
+            return_prediction: if True, also return the predicted clean trajectory (``epsilon``
+                predictions are converted back to a trajectory via ``_ddpm_scheduler_remove_noise``).
+            over_batch: if True, return the per-item loss ``(B, horizon)`` instead of a scalar mean.
+            scheduler_type: selects the noise scheduler ("DDPM" or "DDIM") used to compute the cost;
+                ``None`` uses the policy's default (``config.noise_scheduler_type``).
         """
         # Input validation.
-        assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
-        assert OBS_IMAGES in batch or OBS_ENV_STATE in batch
-        n_obs_steps = batch[OBS_STATE].shape[1]
-        horizon = batch[ACTION].shape[1]
-        #assert horizon == self.config.horizon
+        assert set(batch).issuperset({"observation.state", "action", "action_is_pad"})
+        assert "observation.images" in batch or "observation.environment_state" in batch
+        n_obs_steps = batch["observation.state"].shape[1]
+        horizon = batch["action"].shape[1]
+        assert horizon == self.config.horizon
         assert n_obs_steps == self.config.n_obs_steps
 
         scheduler = self._get_scheduler(scheduler_type)
@@ -506,10 +441,10 @@ class DiffusionModel(nn.Module):
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
         # Forward diffusion.
-        trajectory = batch[ACTION]
+        trajectory = batch["action"]
         # Sample noise to add to the trajectory.
         eps = torch.randn(trajectory.shape, device=trajectory.device)
-        # Sample a random noising timestep for each item in the batch.
+        # Sample a random noising timestep for each item in the batch (unless one was provided).
         if timesteps is None:
             timesteps = torch.randint(
                 low=0,
@@ -523,14 +458,12 @@ class DiffusionModel(nn.Module):
         # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
         pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
 
-        
-
         # Compute the loss.
         # The target is either the original trajectory, or the noise.
         if self.config.prediction_type == "epsilon":
             target = eps
         elif self.config.prediction_type == "sample":
-            target = batch[ACTION]
+            target = batch["action"]
         else:
             raise ValueError(f"Unsupported prediction type {self.config.prediction_type}")
 
@@ -547,43 +480,43 @@ class DiffusionModel(nn.Module):
             loss = loss * in_episode_bound.unsqueeze(-1)
 
         if return_prediction:
+            # Recover the predicted clean trajectory from the (epsilon) prediction.
             pred_target = _ddpm_scheduler_remove_noise(scheduler, noisy_trajectory, pred, timesteps)
-
             if over_batch:
-                return loss.mean(dim=(2)), pred_target
+                return loss.mean(dim=2), pred_target
             return loss.mean(), pred_target
         if over_batch:
-            return loss.mean(dim=(2))
+            return loss.mean(dim=2)
         return loss.mean()
 
     def compute_partial_restoration_gap(
         self,
         batch: dict[str, Tensor],
-        timesteps: Tensor | int = None,
+        timesteps: Tensor | int | None = None,
         return_prediction: bool = False,
         over_batch: bool = False,
         scheduler_type: str | None = None,
     ) -> Tensor:
-        """Score a trajectory by the gap left after a full reverse restoration from `timesteps`.
+        """Score a trajectory by the gap left after a full reverse restoration from ``timesteps``.
 
-        Unlike `compute_loss`, which takes a single denoising step, this noises the actions to the
+        Unlike ``compute_loss``, which takes a single denoising step, this noises the actions to the
         given start timestep and then walks the reverse diffusion chain all the way down to t=0 (the
-        same scheduler loop as `conditional_sample`, without guidance or stochastic resampling),
+        same scheduler loop as ``conditional_sample``, without guidance or stochastic resampling),
         measuring how far the restored trajectory lands from the original actions. Signature and
-        return contract mirror `compute_loss` so it is a drop-in.
+        return contract mirror ``compute_loss`` so it is a drop-in.
 
         ``scheduler_type`` selects the noise scheduler ("DDPM" or "DDIM") used for the reverse chain;
         ``None`` uses the policy's default (``config.noise_scheduler_type``). DDPM steps are
         stochastic while DDIM steps are deterministic, so this changes the restored trajectory.
         """
-        assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
-        assert OBS_IMAGES in batch or OBS_ENV_STATE in batch
-        assert batch[OBS_STATE].shape[1] == self.config.n_obs_steps
+        assert set(batch).issuperset({"observation.state", "action", "action_is_pad"})
+        assert "observation.images" in batch or "observation.environment_state" in batch
+        assert batch["observation.state"].shape[1] == self.config.n_obs_steps
 
         scheduler = self._get_scheduler(scheduler_type)
 
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
-        trajectory = batch[ACTION]
+        trajectory = batch["action"]
         batch_size = trajectory.shape[0]
         device = trajectory.device
 
@@ -622,17 +555,17 @@ class DiffusionModel(nn.Module):
 
         if return_prediction:
             if over_batch:
-                return loss.mean(dim=(2)), restored
+                return loss.mean(dim=2), restored
             return loss.mean(), restored
         if over_batch:
-            return loss.mean(dim=(2))
+            return loss.mean(dim=2)
         return loss.mean()
 
 
 class SpatialSoftmax(nn.Module):
     """
     Spatial Soft Argmax operation described in "Deep Spatial Autoencoders for Visuomotor Learning" by Finn et al.
-    (https://huggingface.co/papers/1509.06113). A minimal port of the robomimic implementation.
+    (https://arxiv.org/pdf/1509.06113). A minimal port of the robomimic implementation.
 
     At a high level, this takes 2D feature maps (from a convnet/ViT) and returns the "center of mass"
     of activations of each channel, i.e., keypoints in the image space for the policy to focus on.
@@ -701,7 +634,7 @@ class SpatialSoftmax(nn.Module):
 
 
 class DiffusionRgbEncoder(nn.Module):
-    """Encodes an RGB image into a 1D feature vector.
+    """Encoder an RGB image into a 1D feature vector.
 
     Includes the ability to normalize and crop the image first.
     """
@@ -740,16 +673,19 @@ class DiffusionRgbEncoder(nn.Module):
 
         # Set up pooling and final layers.
         # Use a dry run to get the feature map shape.
-        # The dummy input should take the number of image channels from `config.image_features` and it should
+        # The dummy input should take the number of image channels from `config.input_shapes` and it should
         # use the height and width from `config.crop_shape` if it is provided, otherwise it should use the
-        # height and width from `config.image_features`.
-
+        # height and width from `config.input_shapes`.
+        image_keys = [k for k in config.input_shapes if k.startswith("observation.image")]
         # Note: we have a check in the config class to make sure all images have the same shape.
-        images_shape = next(iter(config.image_features.values())).shape
-        dummy_shape_h_w = config.crop_shape if config.crop_shape is not None else images_shape[1:]
-        dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
-        feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
-
+        image_key = image_keys[0]
+        dummy_input_h_w = (
+            config.crop_shape if config.crop_shape is not None else config.input_shapes[image_key][1:]
+        )
+        dummy_input = torch.zeros(size=(1, config.input_shapes[image_key][0], *dummy_input_h_w))
+        with torch.inference_mode():
+            dummy_feature_map = self.backbone(dummy_input)
+        feature_map_shape = tuple(dummy_feature_map.shape[1:])
         self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
         self.feature_dim = config.spatial_softmax_num_keypoints * 2
         self.out = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
@@ -866,7 +802,7 @@ class DiffusionConditionalUnet1d(nn.Module):
 
         # In channels / out channels for each downsampling block in the Unet's encoder. For the decoder, we
         # just reverse these.
-        in_out = [(config.action_feature.shape[0], config.down_dims[0])] + list(
+        in_out = [(config.output_shapes["action"][0], config.down_dims[0])] + list(
             zip(config.down_dims[:-1], config.down_dims[1:], strict=True)
         )
 
@@ -921,7 +857,7 @@ class DiffusionConditionalUnet1d(nn.Module):
 
         self.final_conv = nn.Sequential(
             DiffusionConv1dBlock(config.down_dims[0], config.down_dims[0], kernel_size=config.kernel_size),
-            nn.Conv1d(config.down_dims[0], config.action_feature.shape[0], 1),
+            nn.Conv1d(config.down_dims[0], config.output_shapes["action"][0], 1),
         )
 
     def forward(self, x: Tensor, timestep: Tensor | int, global_cond=None) -> Tensor:
@@ -990,7 +926,7 @@ class DiffusionConditionalResidualBlock1d(nn.Module):
 
         self.conv1 = DiffusionConv1dBlock(in_channels, out_channels, kernel_size, n_groups=n_groups)
 
-        # FiLM modulation (https://huggingface.co/papers/1709.07871) outputs per-channel bias and (maybe) scale.
+        # FiLM modulation (https://arxiv.org/abs/1709.07871) outputs per-channel bias and (maybe) scale.
         cond_channels = out_channels * 2 if use_film_scale_modulation else out_channels
         self.cond_encoder = nn.Sequential(nn.Mish(), nn.Linear(cond_dim, cond_channels))
 

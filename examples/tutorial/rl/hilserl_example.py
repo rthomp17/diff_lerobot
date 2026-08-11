@@ -4,29 +4,31 @@ from pathlib import Path
 from queue import Empty, Full
 
 import torch
-import torch.optim as optim
 
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.utils import hw_to_dataset_features
+from lerobot.datasets import LeRobotDataset
 from lerobot.envs.configs import HILSerlProcessorConfig, HILSerlRobotEnvConfig
-from lerobot.policies.sac.configuration_sac import SACConfig
-from lerobot.policies.sac.modeling_sac import SACPolicy
-from lerobot.policies.sac.reward_model.modeling_classifier import Classifier
+from lerobot.policies import GaussianActorConfig
+from lerobot.policies.gaussian_actor.modeling_gaussian_actor import GaussianActorPolicy
+from lerobot.rewards.classifier.modeling_classifier import Classifier
+from lerobot.rl.algorithms.sac import SACAlgorithm, SACAlgorithmConfig
 from lerobot.rl.buffer import ReplayBuffer
 from lerobot.rl.gym_manipulator import make_robot_env
-from lerobot.robots.so100_follower import SO100FollowerConfig
-from lerobot.teleoperators.so100_leader import SO100LeaderConfig
-from lerobot.teleoperators.utils import TeleopEvents
+from lerobot.robots.so_follower import SO100FollowerConfig
+from lerobot.teleoperators import TeleopEvents
+from lerobot.teleoperators.so_leader import SO100LeaderConfig
+from lerobot.utils.feature_utils import hw_to_dataset_features
 
 LOG_EVERY = 10
 SEND_EVERY = 10
+MAX_EPISODES = 5
+MAX_STEPS_PER_EPISODE = 20
 
 
 def run_learner(
     transitions_queue: mp.Queue,
     parameters_queue: mp.Queue,
     shutdown_event: mp.Event,
-    policy_learner: SACPolicy,
+    policy_learner: GaussianActorPolicy,
     online_buffer: ReplayBuffer,
     offline_buffer: ReplayBuffer,
     lr: float = 3e-4,
@@ -38,8 +40,9 @@ def run_learner(
     policy_learner.train()
     policy_learner.to(device)
 
-    # Create Adam optimizer from scratch - simple and clean
-    optimizer = optim.Adam(policy_learner.parameters(), lr=lr)
+    algo_config = SACAlgorithmConfig.from_policy_config(policy_learner.config)
+    algorithm = SACAlgorithm(policy=policy_learner, config=algo_config)
+    algorithm.make_optimizers_and_scheduler()
 
     print(f"[LEARNER] Online buffer capacity: {online_buffer.capacity}")
     print(f"[LEARNER] Offline buffer capacity: {offline_buffer.capacity}")
@@ -81,24 +84,26 @@ def run_learner(
                 else:
                     batch[key] = online_batch[key]
 
-            loss, _ = policy_learner.forward(batch)
+            def batch_iter(b=batch):
+                while True:
+                    yield b
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            stats = algorithm.update(batch_iter())
             training_step += 1
 
             if training_step % LOG_EVERY == 0:
+                log_dict = stats.to_log_dict()
                 print(
-                    f"[LEARNER] Training step {training_step}, Loss: {loss.item():.4f}, "
+                    f"[LEARNER] Training step {training_step}, "
+                    f"critic_loss: {log_dict.get('critic', 'N/A'):.4f}, "
                     f"Buffers: Online={len(online_buffer)}, Offline={len(offline_buffer)}"
                 )
 
             # Send updated parameters to actor every 10 training steps
             if training_step % SEND_EVERY == 0:
                 try:
-                    state_dict = {k: v.cpu() for k, v in policy_learner.state_dict().items()}
-                    parameters_queue.put_nowait(state_dict)
+                    weights = algorithm.get_weights()
+                    parameters_queue.put_nowait(weights)
                     print("[LEARNER] Sent updated parameters to actor")
                 except Full:
                     # Missing write due to queue not being consumed (should happen rarely)
@@ -111,7 +116,7 @@ def run_actor(
     transitions_queue: mp.Queue,
     parameters_queue: mp.Queue,
     shutdown_event: mp.Event,
-    policy_actor: SACPolicy,
+    policy_actor: GaussianActorPolicy,
     reward_classifier: Classifier,
     env_cfg: HILSerlRobotEnvConfig,
     device: torch.device = "mps",
@@ -142,15 +147,15 @@ def run_actor(
 
             while step < MAX_STEPS_PER_EPISODE and not shutdown_event.is_set():
                 try:
-                    new_params = parameters_queue.get_nowait()
-                    policy_actor.load_state_dict(new_params)
+                    new_weights = parameters_queue.get_nowait()
+                    policy_actor.load_state_dict(new_weights)
                     print("[ACTOR] Updated policy parameters from learner")
                 except Empty:  # No new updated parameters available from learner, waiting
                     pass
 
-                # Get action from policy
+                # Get action from policy (returns full action: continuous + discrete)
                 policy_obs = make_policy_obs(obs, device=device)
-                action_tensor = policy_actor.select_action(policy_obs)  # predicts a single action
+                action_tensor = policy_actor.select_action(policy_obs)
                 action = action_tensor.squeeze(0).cpu().numpy()
 
                 # Step environment
@@ -223,123 +228,123 @@ def make_policy_obs(obs, device: torch.device = "cpu"):
     }
 
 
-"""Main function - coordinates actor and learner processes."""
+def main():
+    """Main function - coordinates actor and learner processes."""
 
-device = "mps"  # or "cuda" or "cpu"
-output_directory = Path("outputs/robot_learning_tutorial/hil_serl")
-output_directory.mkdir(parents=True, exist_ok=True)
+    device = "mps"  # or "cuda" or "cpu"
+    output_directory = Path("outputs/robot_learning_tutorial/hil_serl")
+    output_directory.mkdir(parents=True, exist_ok=True)
 
-# find ports using lerobot-find-port
-follower_port = ...
-leader_port = ...
+    # find ports using lerobot-find-port
+    follower_port = ...
+    leader_port = ...
 
-# the robot ids are used the load the right calibration files
-follower_id = ...
-leader_id = ...
+    # the robot ids are used the load the right calibration files
+    follower_id = ...
+    leader_id = ...
 
-# A pretrained model (to be used in-distribution!)
-reward_classifier_id = "fracapuano/reward_classifier_hil_serl_example"
-reward_classifier = Classifier.from_pretrained(reward_classifier_id)
+    # A pretrained model (to be used in-distribution!)
+    reward_classifier_id = "<user>/reward_classifier_hil_serl_example"
+    reward_classifier = Classifier.from_pretrained(reward_classifier_id)
 
-reward_classifier.to(device)
-reward_classifier.eval()
+    reward_classifier.to(device)
+    reward_classifier.eval()
 
-MAX_EPISODES = 5
-MAX_STEPS_PER_EPISODE = 20
+    # Robot and environment configuration
+    robot_cfg = SO100FollowerConfig(port=follower_port, id=follower_id)
+    teleop_cfg = SO100LeaderConfig(port=leader_port, id=leader_id)
+    processor_cfg = HILSerlProcessorConfig(control_mode="leader")
 
-# Robot and environment configuration
-robot_cfg = SO100FollowerConfig(port=follower_port, id=follower_id)
-teleop_cfg = SO100LeaderConfig(port=leader_port, id=leader_id)
-processor_cfg = HILSerlProcessorConfig(control_mode="leader")
+    env_cfg = HILSerlRobotEnvConfig(robot=robot_cfg, teleop=teleop_cfg, processor=processor_cfg)
 
-env_cfg = HILSerlRobotEnvConfig(robot=robot_cfg, teleop=teleop_cfg, processor=processor_cfg)
+    # Create robot environment
+    env, teleop_device = make_robot_env(env_cfg)
 
-# Create robot environment
-env, teleop_device = make_robot_env(env_cfg)
+    obs_features = hw_to_dataset_features(env.robot.observation_features, "observation")
+    action_features = hw_to_dataset_features(env.robot.action_features, "action")
 
-obs_features = hw_to_dataset_features(env.robot.observation_features, "observation")
-action_features = hw_to_dataset_features(env.robot.action_features, "action")
+    # Create SAC policy for action selection
+    policy_cfg = GaussianActorConfig(
+        device=device,
+        input_features=obs_features,
+        output_features=action_features,
+    )
 
-# Create SAC policy for action selection
-policy_cfg = SACConfig(
-    device=device,
-    input_features=obs_features,
-    output_features=action_features,
-)
+    policy_actor = GaussianActorPolicy(policy_cfg)
+    policy_learner = GaussianActorPolicy(policy_cfg)
 
-policy_actor = SACPolicy(policy_cfg)
-policy_learner = SACPolicy(policy_cfg)
+    demonstrations_repo_id = "lerobot/example_hil_serl_dataset"
+    offline_dataset = LeRobotDataset(repo_id=demonstrations_repo_id)
 
-demonstrations_repo_id = "lerobot/example_hil_serl_dataset"
-offline_dataset = LeRobotDataset(repo_id=demonstrations_repo_id)
+    # Online buffer: initialized from scratch
+    online_replay_buffer = ReplayBuffer(device=device, state_keys=list(obs_features.keys()))
+    # Offline buffer: Created from dataset (pre-populated it with demonstrations)
+    offline_replay_buffer = ReplayBuffer.from_lerobot_dataset(
+        lerobot_dataset=offline_dataset, device=device, state_keys=list(obs_features.keys())
+    )
 
-# Online buffer: initialized from scratch
-online_replay_buffer = ReplayBuffer(device=device, state_keys=list(obs_features.keys()))
-# Offline buffer: Created from dataset (pre-populated it with demonstrations)
-offline_replay_buffer = ReplayBuffer.from_lerobot_dataset(
-    lerobot_dataset=offline_dataset, device=device, state_keys=list(obs_features.keys())
-)
+    # Create communication channels between learner and actor processes
+    transitions_queue = mp.Queue(maxsize=10)
+    parameters_queue = mp.Queue(maxsize=2)
+    shutdown_event = mp.Event()
 
-# Create communication channels between learner and actor processes
-transitions_queue = mp.Queue(maxsize=10)
-parameters_queue = mp.Queue(maxsize=2)
-shutdown_event = mp.Event()
+    # Signal handler for graceful shutdown
+    def signal_handler(sig):
+        print(f"\nSignal {sig} received, shutting down...")
+        shutdown_event.set()
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # Create processes
+    learner_process = mp.Process(
+        target=run_learner,
+        args=(
+            transitions_queue,
+            parameters_queue,
+            shutdown_event,
+            policy_learner,
+            online_replay_buffer,
+            offline_replay_buffer,
+        ),
+        kwargs={"device": device},  # can run on accelerated hardware for training
+    )
+
+    actor_process = mp.Process(
+        target=run_actor,
+        args=(
+            transitions_queue,
+            parameters_queue,
+            shutdown_event,
+            policy_actor,
+            reward_classifier,
+            env_cfg,
+            output_directory,
+        ),
+        kwargs={"device": "cpu"},  # actor is frozen, can run on CPU or accelerate for inference
+    )
+
+    learner_process.start()
+    actor_process.start()
+
+    try:
+        # Wait for actor to finish (it controls the episode loop)
+        actor_process.join()
+        shutdown_event.set()
+        learner_process.join(timeout=10)
+
+    except KeyboardInterrupt:
+        print("Main process interrupted")
+        shutdown_event.set()
+        actor_process.join(timeout=5)
+        learner_process.join(timeout=10)
+
+    finally:
+        if learner_process.is_alive():
+            learner_process.terminate()
+        if actor_process.is_alive():
+            actor_process.terminate()
 
 
-# Signal handler for graceful shutdown
-def signal_handler(sig):
-    print(f"\nSignal {sig} received, shutting down...")
-    shutdown_event.set()
-
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-
-# Create processes
-learner_process = mp.Process(
-    target=run_learner,
-    args=(
-        transitions_queue,
-        parameters_queue,
-        shutdown_event,
-        policy_learner,
-        online_replay_buffer,
-        offline_replay_buffer,
-    ),
-    kwargs={"device": device},  # can run on accelerated hardware for training
-)
-
-actor_process = mp.Process(
-    target=run_actor,
-    args=(
-        transitions_queue,
-        parameters_queue,
-        shutdown_event,
-        policy_actor,
-        reward_classifier,
-        env_cfg,
-        output_directory,
-    ),
-    kwargs={"device": "cpu"},  # actor is frozen, can run on CPU or accelerate for inference
-)
-
-learner_process.start()
-actor_process.start()
-
-try:
-    # Wait for actor to finish (it controls the episode loop)
-    actor_process.join()
-    shutdown_event.set()
-    learner_process.join(timeout=10)
-
-except KeyboardInterrupt:
-    print("Main process interrupted")
-    shutdown_event.set()
-    actor_process.join(timeout=5)
-    learner_process.join(timeout=10)
-
-finally:
-    if learner_process.is_alive():
-        learner_process.terminate()
-    if actor_process.is_alive():
-        actor_process.terminate()
+if __name__ == "__main__":
+    main()

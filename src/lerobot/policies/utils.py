@@ -16,17 +16,15 @@
 
 import logging
 from collections import deque
-from typing import Any
 
 import numpy as np
 import torch
 from torch import nn
 
-from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.datasets.utils import build_dataset_frame
-from lerobot.processor import PolicyAction, RobotAction, RobotObservation
+from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
+from lerobot.lerobot_types import PolicyAction, RobotAction, RobotObservation
 from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.utils.feature_utils import build_dataset_frame
 
 
 def populate_queues(
@@ -128,7 +126,8 @@ def prepare_observation_for_inference(
     for name in observation:
         observation[name] = torch.from_numpy(observation[name])
         if "image" in name:
-            observation[name] = observation[name].type(torch.float32) / 255
+            if observation[name].dtype == torch.uint8:
+                observation[name] = observation[name].type(torch.float32) / 255
             observation[name] = observation[name].permute(2, 0, 1).contiguous()
         observation[name] = observation[name].unsqueeze(0)
         observation[name] = observation[name].to(device)
@@ -140,7 +139,7 @@ def prepare_observation_for_inference(
 
 
 def build_inference_frame(
-    observation: dict[str, Any],
+    observation: RobotObservation,
     device: torch.device,
     ds_features: dict[str, dict],
     task: str | None = None,
@@ -231,11 +230,20 @@ def validate_visual_features_consistency(
     """
     Validates visual feature consistency between a policy config and provided dataset/environment features.
 
+    Validation passes if EITHER:
+    - Policy's expected visuals are a subset of dataset (policy uses some cameras, dataset has more)
+    - Dataset's provided visuals are a subset of policy (policy declares extras for flexibility)
+
     Args:
         cfg (PreTrainedConfig): The model or policy configuration containing input_features and type.
         features (Dict[str, PolicyFeature]): A mapping of feature names to PolicyFeature objects.
     """
     expected_visuals = {k for k, v in cfg.input_features.items() if v.type == FeatureType.VISUAL}
     provided_visuals = {k for k, v in features.items() if v.type == FeatureType.VISUAL}
-    if not provided_visuals.issubset(expected_visuals):
+
+    # Accept if either direction is a subset
+    policy_subset_of_dataset = expected_visuals.issubset(provided_visuals)
+    dataset_subset_of_policy = provided_visuals.issubset(expected_visuals)
+
+    if not (policy_subset_of_dataset or dataset_subset_of_policy):
         raise_feature_mismatch_error(provided_visuals, expected_visuals)

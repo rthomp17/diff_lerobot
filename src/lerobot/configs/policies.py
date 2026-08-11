@@ -26,12 +26,12 @@ from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import CONFIG_NAME
 from huggingface_hub.errors import HfHubHTTPError
 
-from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.optim.optimizers import OptimizerConfig
-from lerobot.optim.schedulers import LRSchedulerConfig
+from lerobot.optim import LRSchedulerConfig, OptimizerConfig
 from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.device_utils import auto_select_torch_device, is_amp_available, is_torch_device_available
 from lerobot.utils.hub import HubMixin
-from lerobot.utils.utils import auto_select_torch_device, is_amp_available, is_torch_device_available
+
+from .types import FeatureType, PolicyFeature
 
 T = TypeVar("T", bound="PreTrainedConfig")
 logger = getLogger(__name__)
@@ -45,23 +45,27 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
     Args:
         n_obs_steps: Number of environment steps worth of observations to pass to the policy (takes the
             current step and additional steps going back).
-        input_shapes: A dictionary defining the shapes of the input data for the policy.
-        output_shapes: A dictionary defining the shapes of the output data for the policy.
-        input_normalization_modes: A dictionary with key representing the modality and the value specifies the
-            normalization mode to apply.
-        output_normalization_modes: Similar dictionary as `input_normalization_modes`, but to unnormalize to
-            the original scale.
+        input_features: A dictionary defining the PolicyFeature of the input data for the policy. The key represents
+            the input data name, and the value is PolicyFeature, which consists of FeatureType and shape attributes.
+        output_features: A dictionary defining the PolicyFeature of the output data for the policy. The key represents
+            the output data name, and the value is PolicyFeature, which consists of FeatureType and shape attributes.
+        normalization_mapping: A dictionary that maps from a str value of FeatureType (e.g., "STATE", "VISUAL") to
+            a corresponding NormalizationMode (e.g., NormalizationMode.MIN_MAX)
     """
 
     n_obs_steps: int = 1
 
-    input_features: dict[str, PolicyFeature] = field(default_factory=dict)
-    output_features: dict[str, PolicyFeature] = field(default_factory=dict)
+    # `input_features` can be set to None/null in order to infer those values from the dataset.
+    input_features: dict[str, PolicyFeature] | None = field(default_factory=dict)
+    output_features: dict[str, PolicyFeature] | None = field(default_factory=dict)
 
     device: str | None = None  # e.g. "cuda", "cuda:0", "cpu", or "mps"
     # `use_amp` determines whether to use Automatic Mixed Precision (AMP) for training and evaluation. With AMP,
     # automatic gradient scaling is used.
     use_amp: bool = False
+
+    # Whether the policy employed PEFT for training.
+    use_peft: bool = False
 
     push_to_hub: bool = True  # type: ignore[assignment] # TODO: use a different name to avoid override
     repo_id: str | None = None
@@ -75,6 +79,8 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
     # Either the repo ID of a model hosted on the Hub or a path to a directory containing weights
     # saved using `Policy.save_pretrained`. If not provided, the policy is initialized from scratch.
     pretrained_path: Path | None = None
+    # Optional Hub revision (commit hash, branch, or tag) to pin the pretrained model version.
+    pretrained_revision: str | None = None
 
     def __post_init__(self) -> None:
         if not self.device or not is_torch_device_available(self.device):
@@ -125,6 +131,8 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
 
     @property
     def robot_state_feature(self) -> PolicyFeature | None:
+        if not self.input_features:
+            return None
         for ft_name, ft in self.input_features.items():
             if ft.type is FeatureType.STATE and ft_name == OBS_STATE:
                 return ft
@@ -132,6 +140,8 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
 
     @property
     def env_state_feature(self) -> PolicyFeature | None:
+        if not self.input_features:
+            return None
         for _, ft in self.input_features.items():
             if ft.type is FeatureType.ENV:
                 return ft
@@ -139,18 +149,24 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
 
     @property
     def image_features(self) -> dict[str, PolicyFeature]:
+        if not self.input_features:
+            return {}
         return {key: ft for key, ft in self.input_features.items() if ft.type is FeatureType.VISUAL}
 
     @property
     def action_feature(self) -> PolicyFeature | None:
+        if not self.output_features:
+            return None
         for ft_name, ft in self.output_features.items():
             if ft.type is FeatureType.ACTION and ft_name == ACTION:
                 return ft
         return None
 
     def _save_pretrained(self, save_directory: Path) -> None:
-        with open(save_directory / CONFIG_NAME, "w") as f, draccus.config_type("json"):
-            draccus.dump(self, f, indent=4)
+        # Encode against the base class so draccus includes the choice "type" key,
+        # which `from_pretrained` needs to resolve the concrete subclass.
+        with open(save_directory / CONFIG_NAME, "w") as f:
+            json.dump(draccus.encode(self, PreTrainedConfig), f, indent=4)
 
     @classmethod
     def from_pretrained(
@@ -191,24 +207,30 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
                     f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
                 ) from e
 
-        # HACK: Parse the original config to get the config subclass, so that we can
-        # apply cli overrides.
-        # This is very ugly, ideally we'd like to be able to do that natively with draccus
-        # something like --policy.path (in addition to --policy.type)
-        with draccus.config_type("json"):
-            orig_config = draccus.parse(cls, config_file, args=[])
-
         if config_file is None:
             raise FileNotFoundError(f"{CONFIG_NAME} not found in {model_id}")
 
         with open(config_file) as f:
             config = json.load(f)
 
-        config.pop("type")
+        # Resolve the concrete config subclass from the serialized "type" tag, then parse
+        # the config (with CLI overrides) directly for that class. The "type" key is
+        # stripped because draccus only consumes it when parsing the registry base class.
+        policy_type = config.pop("type", None)
+        if policy_type is None:
+            raise ValueError(f"Missing 'type' field in {CONFIG_NAME} of {model_id}")
+        try:
+            config_cls = cls.get_choice_class(policy_type)
+        except Exception as e:
+            raise ValueError(
+                f"Policy type '{policy_type}' (from {CONFIG_NAME} of {model_id}) is not registered. "
+                f"Available policy types: {cls.get_known_choices()}"
+            ) from e
+
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
             json.dump(config, f)
             config_file = f.name
 
         cli_overrides = policy_kwargs.pop("cli_overrides", [])
         with draccus.config_type("json"):
-            return draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
+            return draccus.parse(config_cls, config_file, args=cli_overrides)
